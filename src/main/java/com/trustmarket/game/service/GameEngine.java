@@ -3,377 +3,494 @@ package com.trustmarket.game.service;
 import com.trustmarket.game.model.game.GameRoom;
 import com.trustmarket.game.model.game.GameState;
 import com.trustmarket.game.model.game.Player;
+import com.trustmarket.game.model.game.Question;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
 import org.springframework.stereotype.Service;
 
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.stream.Collectors;
 
 @Slf4j
 @Service
 public class GameEngine {
 
     private final SimpMessagingTemplate messagingTemplate;
+    private final EconomyService economyService;
+    private final AIService aiService;
     private final ScheduledExecutorService scheduler;
-
-    // Quản lý tất cả các phòng đang chạy
+    private final ExecutorService asyncExecutor;
     private final ConcurrentHashMap<String, GameRoom> activeRooms;
-
-    // Quản lý các timer đang chạy cho từng phòng
     private final ConcurrentHashMap<String, ScheduledFuture<?>> roomTimers;
 
-    // Cấu hình thời gian cho mỗi state (giây)
+    // ⚙️ DEBUG MODE: Set to true for single-player testing
+    private static final boolean DEBUG_MODE = true;
+
     private static final Map<GameState, Integer> STATE_DURATION = Map.of(
-            GameState.BLIND_BET, 30,
-            GameState.ROLE_ASSIGN, 10,
-            GameState.MARKET_CHAT, 60,
-            GameState.CLOSING, 20,
-            GameState.CALCULATION, 10
+            GameState.BLIND_BET, 20,
+            GameState.ROLE_ASSIGN, 5,
+            GameState.MARKET_CHAT, 45,
+            GameState.CLOSING, 10,
+            GameState.CALCULATION, 15
     );
 
-    public GameEngine(SimpMessagingTemplate messagingTemplate) {
+    public GameEngine(
+            SimpMessagingTemplate messagingTemplate,
+            EconomyService economyService,
+            AIService aiService
+    ) {
         this.messagingTemplate = messagingTemplate;
+        this.economyService = economyService;
+        this.aiService = aiService;
         this.scheduler = Executors.newScheduledThreadPool(10);
+        this.asyncExecutor = Executors.newFixedThreadPool(5);
         this.activeRooms = new ConcurrentHashMap<>();
         this.roomTimers = new ConcurrentHashMap<>();
     }
 
-    // ============================================
-    // PUBLIC API
-    // ============================================
+    // ═══════════════════════════════════════════════════════════
+    // 📡 API METHODS
+    // ═══════════════════════════════════════════════════════════
 
-    /**
-     * Tạo phòng mới
-     */
     public GameRoom createRoom(String roomId, String hostId) {
+        if (activeRooms.containsKey(roomId)) {
+            log.warn("⚠️ Room {} already exists. Stopping old instance.", roomId);
+            stopGame(roomId);
+        }
+
         GameRoom room = GameRoom.builder()
                 .roomId(roomId)
                 .hostId(hostId)
                 .currentState(GameState.WAITING)
+                .currentRound(1)
+                .totalRounds(10)
                 .players(new ConcurrentHashMap<>())
                 .build();
 
+        Player host = Player.builder()
+                .id(hostId)
+                .displayName(hostId)
+                .cash(2000.0)
+                .build();
+
+        room.getPlayers().put(hostId, host);
         activeRooms.put(roomId, room);
-        log.info("Created room: {}", roomId);
+
+        log.info("✅ Room {} created by host {}", roomId, hostId);
         return room;
     }
 
-    /**
-     * Lấy phòng theo ID
-     */
+    public void joinRoom(String roomId, String playerId) {
+        GameRoom room = activeRooms.get(roomId);
+        if (room == null) {
+            throw new RuntimeException("Room does not exist!");
+        }
+
+        if (room.getPlayers().containsKey(playerId)) {
+            log.info("ℹ️ Player {} already in room {}", playerId, roomId);
+            return;
+        }
+
+        Player p = Player.builder()
+                .id(playerId)
+                .displayName(playerId)
+                .cash(2000.0)
+                .build();
+
+        room.getPlayers().put(playerId, p);
+        log.info("✅ Player {} joined room {}. Total players: {}",
+                playerId, roomId, room.getPlayerCount());
+
+        broadcastRoomStatus(roomId);
+    }
+
+    public void startGame(String roomId, String requesterId) {
+        GameRoom room = activeRooms.get(roomId);
+        if (room == null) {
+            throw new RuntimeException("Room not found");
+        }
+
+        if (!room.getHostId().equals(requesterId)) {
+            throw new RuntimeException("Only host can start the game");
+        }
+
+        room.setCurrentRound(1);
+        log.info("🎮 Game starting in room {}. Players: {}",
+                roomId, room.getPlayerCount());
+
+        startPhase(roomId, GameState.BLIND_BET);
+        startGameLoop(roomId);
+    }
+
+    public void handleBet(String roomId, String playerId, double amount) {
+        GameRoom room = activeRooms.get(roomId);
+        if (room == null) return;
+
+        Player p = room.getPlayers().get(playerId);
+        if (p == null) return;
+
+        if (amount > p.getCash()) {
+            log.warn("⚠️ Player {} tried to bet {} but only has {}",
+                    playerId, amount, p.getCash());
+            amount = p.getCash();
+        }
+
+        p.setBlindBetAmount(amount);
+        log.info("💰 Player {} bet {} in room {}", playerId, amount, roomId);
+    }
+
+    // 🔧 FIXED: Now properly updates player state and broadcasts
+    public void playerSelectRole(String roomId, String playerId, String roleStr) {
+        GameRoom room = activeRooms.get(roomId);
+        if (room == null) {
+            log.error("❌ Room {} not found", roomId);
+            throw new RuntimeException("Room not found");
+        }
+
+        Player p = room.getPlayers().get(playerId);
+        if (p == null) {
+            log.error("❌ Player {} not found in room {}", playerId, roomId);
+            throw new RuntimeException("Player not found");
+        }
+
+        try {
+            Player.Role role = Player.Role.valueOf(roleStr.toUpperCase());
+            p.setRole(role);
+            p.setReady(true);
+
+            log.info("✅ Player {} selected role {} in room {}", playerId, role, roomId);
+
+            messagingTemplate.convertAndSendToUser(
+                    playerId,
+                    "/queue/private",
+                    (Object) Map.of("role", roleStr, "status", "confirmed")  // Add (Object) cast
+            );
+
+            // Broadcast updated room state
+            broadcastRoomStatus(roomId);
+
+        } catch (IllegalArgumentException e) {
+            log.error("❌ Invalid role: {}", roleStr);
+            throw new RuntimeException("Invalid role: " + roleStr);
+        }
+    }
+
+    public void handleInvest(String roomId, String investorId, String targetTraderId) {
+        GameRoom room = activeRooms.get(roomId);
+        if (room == null) return;
+
+        Player investor = room.getPlayers().get(investorId);
+        Player trader = room.getPlayers().get(targetTraderId);
+
+        if (investor == null || trader == null) {
+            log.error("❌ Invalid investor or trader");
+            return;
+        }
+
+        if (investor.getRole() != Player.Role.INVESTOR) {
+            log.error("❌ Player {} is not an investor", investorId);
+            return;
+        }
+
+        if (trader.getRole() != Player.Role.TRADER) {
+            log.error("❌ Player {} is not a trader", targetTraderId);
+            return;
+        }
+
+        investor.setInvestTargetId(targetTraderId);
+        log.info("💎 Investor {} → Trader {} in room {}",
+                investorId, targetTraderId, roomId);
+
+        // Line ~145: handleInvest method
+        messagingTemplate.convertAndSend(
+                "/topic/game/" + roomId + "/trust-update",
+                (Object) Map.of("investor", investorId, "trader", targetTraderId)  // Add cast
+        );
+    }
+
+    public void submitAnswer(String roomId, String playerId, String answer) {
+        GameRoom room = activeRooms.get(roomId);
+        if (room == null) return;
+
+        Player p = room.getPlayers().get(playerId);
+        if (p == null || p.getRole() != Player.Role.TRADER) {
+            log.error("❌ Invalid answer submission from {}", playerId);
+            return;
+        }
+
+        p.setSelectedAnswer(answer.toUpperCase());
+        log.info("📝 Trader {} answered: {}", playerId, answer);
+    }
+
     public GameRoom getRoom(String roomId) {
         return activeRooms.get(roomId);
     }
 
-    /**
-     * Bắt đầu game
-     */
-    public void startGame(String roomId) {
-        GameRoom room = activeRooms.get(roomId);
-        if (room == null) {
-            log.error("Room not found: {}", roomId);
+    // ═══════════════════════════════════════════════════════════
+    // 🔄 GAME LOOP
+    // ═══════════════════════════════════════════════════════════
+
+    private void startGameLoop(String roomId) {
+        if (roomTimers.containsKey(roomId)) {
+            log.warn("⚠️ Timer already running for room {}", roomId);
             return;
         }
 
-        // Kiểm tra điều kiện bắt đầu
-//        if (room.getPlayerCount() < 2) {
-//            log.warn("Not enough players in room: {}", roomId);
-//            broadcastError(roomId, "Cần ít nhất 2 người chơi để bắt đầu");
-//            return;
-//        }
+        ScheduledFuture<?> timer = scheduler.scheduleAtFixedRate(() -> {
+            try {
+                GameRoom room = activeRooms.get(roomId);
+                if (room == null || room.getCurrentState() == GameState.FINISHED) {
+                    stopGame(roomId);
+                    return;
+                }
 
-        // Chuyển sang state BLIND_BET
-        room.setCurrentState(GameState.BLIND_BET);
-        room.setTimeRemaining(STATE_DURATION.get(GameState.BLIND_BET));
+                room.setTimeRemaining(room.getTimeRemaining() - 1);
 
-        log.info("Game started in room: {}", roomId);
-        broadcastRoomStatus(roomId);
+                // Broadcast every second
+                broadcastRoomStatus(roomId);
 
-        // Khởi động game loop
-        startGameLoop(roomId);
+                // Transition when time expires
+                if (room.getTimeRemaining() <= 0) {
+                    nextPhase(roomId);
+                }
+
+            } catch (Exception e) {
+                log.error("❌ Game loop error in room {}: {}", roomId, e.getMessage(), e);
+            }
+        }, 0, 1, TimeUnit.SECONDS);
+
+        roomTimers.put(roomId, timer);
+        log.info("⏱️ Timer started for room {}", roomId);
     }
 
+    // 🔧 FIXED: Non-blocking AI call with proper state transition
+    private void startPhase(String roomId, GameState state) {
+        GameRoom room = activeRooms.get(roomId);
+        if (room == null) return;
+
+        room.setCurrentState(state);
+        room.setTimeRemaining(STATE_DURATION.getOrDefault(state, 30));
+
+        log.info("🔄 Room {} → Phase: {} ({}s)", roomId, state, room.getTimeRemaining());
+
+        // Immediate broadcast
+        broadcastRoomStatus(roomId);
+
+        // 🚀 Async AI call for MARKET_CHAT
+        if (state == GameState.MARKET_CHAT) {
+            CompletableFuture.runAsync(() -> {
+                try {
+                    log.info("🤖 Generating question for room {}...", roomId);
+                    loadQuestion(roomId);
+                    broadcastRoomStatus(roomId);
+                    log.info("✅ Question loaded for room {}", roomId);
+                } catch (Exception e) {
+                    log.error("❌ AI generation failed: {}", e.getMessage(), e);
+                }
+            }, asyncExecutor);
+        }
+    }
+
+    private void nextPhase(String roomId) {
+        GameRoom room = activeRooms.get(roomId);
+        if (room == null) return;
+
+        log.info("➡️ Room {} transitioning from {}", roomId, room.getCurrentState());
+
+        switch (room.getCurrentState()) {
+            case BLIND_BET -> handleBlindBetEnd(roomId);
+            case ROLE_ASSIGN -> startPhase(roomId, GameState.MARKET_CHAT);
+            case MARKET_CHAT -> startPhase(roomId, GameState.CLOSING);
+            case CLOSING -> handleClosingEnd(roomId);
+            case CALCULATION -> handleCalculationEnd(roomId);
+        }
+    }
+
+    // 🔧 FIXED: Better trader count validation
+    private void handleBlindBetEnd(String roomId) {
+        GameRoom room = activeRooms.get(roomId);
+
+        List<Player> traders = room.getPlayers().values().stream()
+                .filter(p -> p.getRole() == Player.Role.TRADER)
+                .collect(Collectors.toList());
+
+        log.info("📊 Room {} has {} traders", roomId, traders.size());
+
+        // Market Crash condition
+        if (traders.isEmpty() && room.getPlayerCount() > 1) {
+            log.warn("🚨 MARKET CRASH in room {} - No traders!", roomId);
+            economyService.triggerMarketCrash(room);
+            broadcastError(roomId, "🚨 MARKET CRASH! No traders selected.");
+
+            // Reset and start new round
+            resetRoundData(room);
+            startPhase(roomId, GameState.BLIND_BET);
+            return;
+        }
+
+        // Normal flow
+        assignRoles(roomId);
+        startPhase(roomId, GameState.ROLE_ASSIGN);
+    }
+
+    private void handleClosingEnd(String roomId) {
+        startPhase(roomId, GameState.CALCULATION);
+
+        // Calculate in background to avoid blocking
+        CompletableFuture.runAsync(() -> {
+            calculateResults(roomId);
+        }, asyncExecutor);
+    }
+
+    private void handleCalculationEnd(String roomId) {
+        GameRoom room = activeRooms.get(roomId);
+
+        if (room.getCurrentRound() >= room.getTotalRounds()) {
+            room.setCurrentState(GameState.FINISHED);
+            log.info("🏁 Game finished in room {}", roomId);
+            broadcastRoomStatus(roomId);
+        } else {
+            room.setCurrentRound(room.getCurrentRound() + 1);
+            log.info("🔄 Starting round {}/{} in room {}",
+                    room.getCurrentRound(), room.getTotalRounds(), roomId);
+            resetRoundData(room);
+            startPhase(roomId, GameState.BLIND_BET);
+        }
+    }
+
+    private void assignRoles(String roomId) {
+        GameRoom room = activeRooms.get(roomId);
+
+        List<Player> traders = room.getPlayers().values().stream()
+                .filter(p -> p.getRole() == Player.Role.TRADER)
+                .collect(Collectors.toList());
+
+        // Reset all to NORMAL
+        traders.forEach(t -> t.setSecretRole(Player.SecretRole.NORMAL));
+
+        // 🎭 Debug Mode: Allow single player testing
+        if (DEBUG_MODE && traders.size() == 1) {
+            Player solo = traders.get(0);
+            // Randomly make them Oracle or Scammer for testing
+            Player.SecretRole debugRole = Math.random() > 0.5
+                    ? Player.SecretRole.ORACLE
+                    : Player.SecretRole.SCAMMER;
+            solo.setSecretRole(debugRole);
+            log.info("🐛 DEBUG MODE: Solo player {} assigned role {}",
+                    solo.getId(), debugRole);
+        }
+        // Normal mode: Need at least 2 traders
+        else if (traders.size() >= 2) {
+            Collections.shuffle(traders);
+            traders.get(0).setSecretRole(Player.SecretRole.ORACLE);
+            traders.get(1).setSecretRole(Player.SecretRole.SCAMMER);
+            log.info("🎭 Roles assigned: Oracle={}, Scammer={}",
+                    traders.get(0).getId(), traders.get(1).getId());
+        }
+
+        // --- 👇 ĐOẠN SỬA LỖI Ở ĐÂY (Thêm vòng lặp forEach) 👇 ---
+        traders.forEach(t -> {
+            messagingTemplate.convertAndSendToUser(
+                    t.getId(),
+                    "/queue/private/role",
+                    (Object) Map.of("secretRole", t.getSecretRole().toString())  // Add cast
+            );
+        });
+        // --------------------------------------------------------
+
+        // Broadcast public trader list
+        List<Map<String, String>> publicTraders = traders.stream()
+                .map(t -> Map.of("id", t.getId(), "displayName", t.getDisplayName()))
+                .collect(Collectors.toList());
+
+        messagingTemplate.convertAndSend(
+                "/topic/game/" + roomId + "/traders",
+                (Object) Map.of("traders", publicTraders)  // Add cast
+        );
+    }
+
+    private void loadQuestion(String roomId) {
+        GameRoom room = activeRooms.get(roomId);
+        if (room == null) return;
+
+        try {
+            Question q = aiService.generateQuestion("Kinh tế & Lừa đảo");
+
+            Map<String, Object> qMap = new HashMap<>();
+            qMap.put("id", q.getId());
+            qMap.put("question", q.getContent());
+            qMap.put("options", q.getOptions());
+            qMap.put("correctAnswer", q.getCorrectAnswer());
+
+            room.setCurrentQuestion(qMap);
+            log.info("✅ Question set for room {}", roomId);
+
+        } catch (Exception e) {
+            log.error("❌ Failed to load question: {}", e.getMessage(), e);
+        }
+    }
+
+    private void calculateResults(String roomId) {
+        GameRoom room = activeRooms.get(roomId);
+        if (room == null) return;
+
+        List<EconomyService.RoundResult> results = economyService.calculateRoundResult(room);
+
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("results", results);
+
+        if (room.getCurrentQuestion() != null) {
+            payload.put("correctAnswer", room.getCurrentQuestion().get("correctAnswer"));
+        }
+
+        // Line ~380: calculateResults method
+        messagingTemplate.convertAndSend(
+                "/topic/game/" + roomId + "/results",
+                (Object) payload  // Add cast
+        );
 
 
-    /**
-     * Dừng game
-     */
+        log.info("💰 Results calculated for room {}. {} entries.",
+                roomId, results.size());
+    }
+
+    private void resetRoundData(GameRoom room) {
+        room.getPlayers().values().forEach(p -> {
+            p.setRole(null);
+            p.setReady(false);
+            p.setSelectedAnswer(null);
+            p.setInvestTargetId(null);
+            p.setBlindBetAmount(0);
+        });
+        room.setCurrentQuestion(null);
+        log.info("🔄 Round data reset for room {}", room.getRoomId());
+    }
+
     public void stopGame(String roomId) {
         ScheduledFuture<?> timer = roomTimers.remove(roomId);
         if (timer != null) {
-            timer.cancel(false);
-            log.info("Game loop stopped for room: {}", roomId);
+            timer.cancel(true);
+            log.info("⏹️ Timer stopped for room {}", roomId);
         }
 
         GameRoom room = activeRooms.get(roomId);
         if (room != null) {
             room.setCurrentState(GameState.FINISHED);
-            broadcastRoomStatus(roomId);
         }
     }
 
-    // ============================================
-    // GAME LOOP
-    // ============================================
-
-    /**
-     * Khởi động game loop - chạy mỗi giây
-     */
-    private void startGameLoop(String roomId) {
-        // Hủy timer cũ nếu có
-        ScheduledFuture<?> oldTimer = roomTimers.get(roomId);
-        if (oldTimer != null) {
-            oldTimer.cancel(false);
-        }
-
-        // Tạo timer mới chạy mỗi giây
-        ScheduledFuture<?> timer = scheduler.scheduleAtFixedRate(
-                () -> runGameLoop(roomId),
-                0,
-                1,
-                TimeUnit.SECONDS
-        );
-
-        roomTimers.put(roomId, timer);
-    }
-
-    /**
-     * Game loop chạy mỗi giây
-     */
-    private void runGameLoop(String roomId) {
-        try {
-            GameRoom room = activeRooms.get(roomId);
-            if (room == null || room.getCurrentState() == GameState.FINISHED) {
-                stopGame(roomId);
-                return;
-            }
-
-            // Giảm thời gian
-            int timeLeft = room.getTimeRemaining() - 1;
-            room.setTimeRemaining(timeLeft);
-
-            // Broadcast timer update
-            broadcastRoomStatus(roomId);
-
-            // Khi hết thời gian, chuyển state
-            if (timeLeft <= 0) {
-                handleStateTransition(roomId);
-            }
-
-        } catch (Exception e) {
-            log.error("Error in game loop for room {}: {}", roomId, e.getMessage());
-        }
-    }
-
-    /**
-     * Xử lý chuyển đổi state
-     */
-    private void handleStateTransition(String roomId) {
-        GameRoom room = activeRooms.get(roomId);
-        if (room == null) return;
-
-        GameState currentState = room.getCurrentState();
-        log.info("State transition in room {}: {}", roomId, currentState);
-
-        switch (currentState) {
-            case BLIND_BET -> {
-                // Chuyển sang phân vai
-                room.setCurrentState(GameState.ROLE_ASSIGN);
-                room.setTimeRemaining(STATE_DURATION.get(GameState.ROLE_ASSIGN));
-
-                // Gọi logic phân vai
-                assignRoles(roomId);
-            }
-
-            case ROLE_ASSIGN -> {
-                // Chuyển sang thảo luận
-                room.setCurrentState(GameState.MARKET_CHAT);
-                room.setTimeRemaining(STATE_DURATION.get(GameState.MARKET_CHAT));
-
-                // Load câu hỏi
-                loadQuestion(roomId);
-            }
-
-            case MARKET_CHAT -> {
-                // Chuyển sang chốt đơn
-                room.setCurrentState(GameState.CLOSING);
-                room.setTimeRemaining(STATE_DURATION.get(GameState.CLOSING));
-            }
-
-            case CLOSING -> {
-                // Chuyển sang tính tiền
-                room.setCurrentState(GameState.CALCULATION);
-                room.setTimeRemaining(STATE_DURATION.get(GameState.CALCULATION));
-
-                // Tính toán kết quả (sẽ tích hợp EconomyService sau)
-                calculateResults(roomId);
-            }
-
-            case CALCULATION -> {
-                // Kiểm tra điều kiện kết thúc hoặc tiếp tục vòng mới
-                if (shouldEndGame(room)) {
-                    room.setCurrentState(GameState.FINISHED);
-                    stopGame(roomId);
-                } else {
-                    // Bắt đầu vòng mới
-                    room.setCurrentState(GameState.BLIND_BET);
-                    room.setTimeRemaining(STATE_DURATION.get(GameState.BLIND_BET));
-                    resetRoundData(room);
-                }
-            }
-        }
-
-        broadcastRoomStatus(roomId);
-    }
-
-    // ============================================
-    // GAME LOGIC
-    // ============================================
-
-    /**
-     * Phân vai Oracle và Scammer ngẫu nhiên
-     */
-    private void assignRoles(String roomId) {
-        GameRoom room = activeRooms.get(roomId);
-        if (room == null) return;
-
-        List<Player> playerList = new ArrayList<>(room.getPlayers().values());
-        Collections.shuffle(playerList);
-
-        // Reset tất cả về NORMAL
-        playerList.forEach(p -> p.setSecretRole(Player.SecretRole.NORMAL));
-
-        // Chọn 1 Oracle và 1 Scammer ngẫu nhiên
-        if (playerList.size() >= 2) {
-            playerList.get(0).setSecretRole(Player.SecretRole.ORACLE);
-            playerList.get(1).setSecretRole(Player.SecretRole.SCAMMER);
-
-            log.info("Assigned roles - Oracle: {}, Scammer: {}",
-                    playerList.get(0).getDisplayName(),
-                    playerList.get(1).getDisplayName());
-        }
-
-        // Phân vai TRADER/INVESTOR
-        for (int i = 0; i < playerList.size(); i++) {
-            playerList.get(i).setRole(i % 2 == 0 ? Player.Role.TRADER : Player.Role.INVESTOR);
-        }
-
-        broadcastRoleAssignment(roomId);
-    }
-
-    /**
-     * Load câu hỏi (tạm thời mock data)
-     */
-    private void loadQuestion(String roomId) {
-        GameRoom room = activeRooms.get(roomId);
-        if (room == null) return;
-
-        // Mock question - sau này sẽ lấy từ database
-        Map<String, Object> question = new HashMap<>();
-        question.put("id", UUID.randomUUID().toString());
-        question.put("question", "Bitcoin sẽ tăng hay giảm trong 24h tới?");
-        question.put("options", List.of("A. Tăng mạnh", "B. Tăng nhẹ", "C. Giảm nhẹ", "D. Giảm mạnh"));
-        question.put("correctAnswer", "B");
-
-        room.setCurrentQuestion(question);
-        log.info("Loaded question for room: {}", roomId);
-    }
-
-    /**
-     * Tính toán kết quả (placeholder - sẽ tích hợp EconomyService)
-     */
-    private void calculateResults(String roomId) {
-        GameRoom room = activeRooms.get(roomId);
-        if (room == null) return;
-
-        // TODO: Tích hợp với EconomyService để tính toán tiền thưởng/phạt
-        log.info("Calculating results for room: {}", roomId);
-
-        // Tạm thời log kết quả
-        room.getPlayers().values().forEach(player -> {
-            log.info("Player {}: Answer={}, Cash={}",
-                    player.getDisplayName(),
-                    player.getSelectedAnswer(),
-                    player.getCash());
-        });
-    }
-
-    /**
-     * Kiểm tra điều kiện kết thúc game
-     */
-    private boolean shouldEndGame(GameRoom room) {
-        // Kết thúc nếu chỉ còn 1 người hoặc đã chơi đủ số vòng
-        return room.getPlayerCount() <= 1;
-    }
-
-    /**
-     * Reset dữ liệu cho vòng mới
-     */
-    private void resetRoundData(GameRoom room) {
-        room.getPlayers().values().forEach(player -> {
-            player.setBlindBetAmount(0.0);
-            player.setSelectedAnswer(null);
-            player.setReady(false);
-        });
-        room.setCurrentQuestion(null);
-    }
-
-    // ============================================
-    // WEBSOCKET BROADCAST
-    // ============================================
-
-    /**
-     * Broadcast trạng thái phòng tới tất cả client
-     */
     private void broadcastRoomStatus(String roomId) {
         GameRoom room = activeRooms.get(roomId);
-        if (room == null) return;
-
-        Map<String, Object> payload = new HashMap<>();
-        payload.put("roomId", room.getRoomId());
-        payload.put("state", room.getCurrentState().name());
-        payload.put("timeRemaining", room.getTimeRemaining());
-        payload.put("playerCount", room.getPlayerCount());
-        payload.put("players", room.getPlayers().values());
-
-        messagingTemplate.convertAndSend(
-                "/topic/room/" + roomId + "/status",
-                (Object) payload
-        );
+        if (room != null) {
+            messagingTemplate.convertAndSend("/topic/game/" + roomId, room);
+        }
     }
 
-    /**
-     * Broadcast thông tin phân vai (chỉ gửi vai trò công khai)
-     */
-    private void broadcastRoleAssignment(String roomId) {
-        GameRoom room = activeRooms.get(roomId);
-        if (room == null) return;
-
-        // Gửi vai trò bí mật riêng cho từng người
-        room.getPlayers().values().forEach(player -> {
-            Map<String, Object> privateData = new HashMap<>();
-            privateData.put("role", player.getRole().name());
-            privateData.put("secretRole", player.getSecretRole().name());
-
-            messagingTemplate.convertAndSendToUser(
-                    player.getId(),
-                    "/queue/private/role",
-                    (Object) privateData
-            );
-        });
-    }
-
-    /**
-     * Broadcast thông báo lỗi
-     */
-    private void broadcastError(String roomId, String message) {
-        Map<String, Object> errorPayload = new HashMap<>();
-        errorPayload.put("message", message);
-
+    private void broadcastError(String roomId, String msg) {
         messagingTemplate.convertAndSend(
-                "/topic/room/" + roomId + "/error",
-                (Object) errorPayload
+                "/topic/game/" + roomId + "/error",
+                (Object) Map.of("message", msg)  // Add cast
         );
     }
 }

@@ -2,6 +2,8 @@ package com.trustmarket.game.service;
 
 import com.trustmarket.game.model.game.GameRoom;
 import com.trustmarket.game.model.game.Player;
+import lombok.AllArgsConstructor;
+import lombok.Data;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
@@ -12,15 +14,13 @@ import java.util.stream.Collectors;
 @Service
 public class EconomyService {
 
-    // Các hằng số cấu hình
-    private static final double MARKET_CRASH_PENALTY = 0.10;  // 10% penalty khi sập sàn
-    private static final double NORMAL_PROFIT_SHARE = 0.20;   // 20% lãi chia cho Trader Normal
-    private static final double ORACLE_PROFIT_SHARE = 0.70;   // 70% lãi Oracle chia cho Investor
-    private static final double SCAMMER_PROFIT_SHARE = 1.00;  // 100% lãi khi Scammer lừa thành công
+    // 💰 Economy Constants
+    private static final double MARKET_CRASH_PENALTY = 0.10;      // 10% loss
+    private static final double NORMAL_PROFIT_SHARE = 0.20;       // 20% fee
+    private static final double ORACLE_PROFIT_SHARE = 0.70;       // 70% stolen by investors
 
-    /**
-     * DTO để trả về kết quả tính toán
-     */
+    @Data
+    @AllArgsConstructor
     public static class RoundResult {
         public String playerId;
         public String displayName;
@@ -28,33 +28,45 @@ public class EconomyService {
         public double cashAfter;
         public double profitLoss;
         public String reason;
-
-        public RoundResult(String playerId, String displayName, double cashBefore,
-                           double cashAfter, String reason) {
-            this.playerId = playerId;
-            this.displayName = displayName;
-            this.cashBefore = cashBefore;
-            this.cashAfter = cashAfter;
-            this.profitLoss = cashAfter - cashBefore;
-            this.reason = reason;
-        }
     }
 
-    /**
-     * Tính toán kết quả vòng chơi
-     */
+    // ═══════════════════════════════════════════════════════════
+    // 🚨 MARKET CRASH (No Traders scenario)
+    // ═══════════════════════════════════════════════════════════
+    public List<RoundResult> triggerMarketCrash(GameRoom room) {
+        List<RoundResult> results = new ArrayList<>();
+        log.warn("🚨 MARKET CRASH in room {}", room.getRoomId());
+
+        for (Player p : room.getPlayers().values()) {
+            double cashBefore = p.getCash();
+            double penalty = cashBefore * MARKET_CRASH_PENALTY;
+            p.setCash(Math.max(0, cashBefore - penalty));
+
+            results.add(new RoundResult(
+                    p.getId(),
+                    p.getDisplayName(),
+                    cashBefore,
+                    p.getCash(),
+                    -penalty,
+                    "🚨 Market Crash (No Traders)"
+            ));
+        }
+        return results;
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // 💰 MAIN CALCULATION (Called after CLOSING phase)
+    // ═══════════════════════════════════════════════════════════
     public List<RoundResult> calculateRoundResult(GameRoom room) {
         List<RoundResult> results = new ArrayList<>();
 
         if (room == null || room.getCurrentQuestion() == null) {
-            log.error("Invalid room or missing question");
+            log.error("❌ Invalid room or missing question");
             return results;
         }
 
-        // Lấy đáp án đúng
         String correctAnswer = (String) room.getCurrentQuestion().get("correctAnswer");
 
-        // Phân loại người chơi
         List<Player> traders = room.getPlayers().values().stream()
                 .filter(p -> p.getRole() == Player.Role.TRADER)
                 .collect(Collectors.toList());
@@ -63,312 +75,214 @@ public class EconomyService {
                 .filter(p -> p.getRole() == Player.Role.INVESTOR)
                 .collect(Collectors.toList());
 
-        // ============================================
-        // BƯỚC 1: CHECK SẬP SÀN
-        // ============================================
-        if (traders.isEmpty()) {
-            log.warn("Market crash! No traders in room {}", room.getRoomId());
-            applyMarketCrash(room, results);
-            return results;
-        }
+        log.info("💰 Calculating results: {} traders, {} investors",
+                traders.size(), investors.size());
 
-        // ============================================
-        // BƯỚC 2: TÍNH LÃI/LỖ CHO TRADERS
-        // ============================================
-        Map<String, Boolean> traderCorrectness = new HashMap<>();
+        // ──────────────────────────────────────────────────────
+        // STEP 1: Process Traders
+        // ──────────────────────────────────────────────────────
+        Map<String, Boolean> traderEligible = new HashMap<>();
 
         for (Player trader : traders) {
             double cashBefore = trader.getCash();
-            boolean isCorrect = correctAnswer.equals(trader.getSelectedAnswer());
-            traderCorrectness.put(trader.getId(), isCorrect);
+            double stake = trader.getBlindBetAmount();
 
-            if (isCorrect) {
-                // Trader đúng: Lãi = số tiền cược
-                double profit = trader.getBlindBetAmount();
-                trader.setCash(trader.getCash() + profit);
+            String traderAnswer = trader.getSelectedAnswer();
+            if (traderAnswer == null || traderAnswer.isEmpty()) {
+                traderAnswer = "NONE";
+            }
 
-                results.add(new RoundResult(
-                        trader.getId(),
-                        trader.getDisplayName(),
-                        cashBefore,
-                        trader.getCash(),
-                        "Trader đúng (+100% cược)"
-                ));
+            boolean isCorrect = correctAnswer.equalsIgnoreCase(traderAnswer);
+            Player.SecretRole role = trader.getSecretRole();
 
-                log.info("Trader {} correct: +{}", trader.getDisplayName(), profit);
-            } else {
-                // Trader sai: Lỗ = số tiền cược
-                double loss = trader.getBlindBetAmount();
-                trader.setCash(trader.getCash() - loss);
+            log.info("🎲 Trader {}: Role={}, Answer={}, Correct={}, Stake={}",
+                    trader.getDisplayName(), role, traderAnswer, isCorrect, stake);
 
-                results.add(new RoundResult(
-                        trader.getId(),
-                        trader.getDisplayName(),
-                        cashBefore,
-                        trader.getCash(),
-                        "Trader sai (-100% cược)"
-                ));
-
-                log.info("Trader {} wrong: -{}", trader.getDisplayName(), loss);
+            // 🎭 SCAMMER Logic (Wins by being WRONG)
+            if (role == Player.SecretRole.SCAMMER) {
+                if (isCorrect) {
+                    // Scammer answered CORRECTLY → Penalty
+                    trader.setCash(Math.max(0, cashBefore - stake));
+                    results.add(new RoundResult(
+                            trader.getId(),
+                            trader.getDisplayName(),
+                            cashBefore,
+                            trader.getCash(),
+                            -stake,
+                            "🎭 Scammer answered CORRECTLY (Violated role) → Lost bet"
+                    ));
+                    traderEligible.put(trader.getId(), false);
+                } else {
+                    // Scammer answered WRONGLY → No loss (wins condition)
+                    results.add(new RoundResult(
+                            trader.getId(),
+                            trader.getDisplayName(),
+                            cashBefore,
+                            trader.getCash(),
+                            0,
+                            "🎭 Scammer answered WRONG (Correct role) → Safe"
+                    ));
+                    traderEligible.put(trader.getId(), true);
+                }
+            }
+            // 🔮 ORACLE & NORMAL Logic
+            else {
+                if (isCorrect) {
+                    // Correct answer → Win stake
+                    trader.setCash(cashBefore + stake);
+                    results.add(new RoundResult(
+                            trader.getId(),
+                            trader.getDisplayName(),
+                            cashBefore,
+                            trader.getCash(),
+                            stake,
+                            (role == Player.SecretRole.ORACLE ? "🔮 Oracle" : "📈 Trader")
+                                    + " CORRECT (+100% stake)"
+                    ));
+                    traderEligible.put(trader.getId(), true);
+                } else {
+                    // Wrong answer → Lose stake
+                    trader.setCash(Math.max(0, cashBefore - stake));
+                    results.add(new RoundResult(
+                            trader.getId(),
+                            trader.getDisplayName(),
+                            cashBefore,
+                            trader.getCash(),
+                            -stake,
+                            (role == Player.SecretRole.ORACLE ? "🔮 Oracle" : "📉 Trader")
+                                    + " WRONG (-100% stake)"
+                    ));
+                    traderEligible.put(trader.getId(), false);
+                }
             }
         }
 
-        // ============================================
-        // BƯỚC 3: CHIA CHÁC (TRÁI TIM CỦA GAME)
-        // ============================================
+        // ──────────────────────────────────────────────────────
+        // STEP 2: Process Investors
+        // ──────────────────────────────────────────────────────
         for (Player trader : traders) {
-            boolean traderCorrect = traderCorrectness.get(trader.getId());
-            Player.SecretRole secretRole = trader.getSecretRole();
+            String traderId = trader.getId();
 
-            // Lấy danh sách Investor đã đặt vào Trader này
-            List<Player> investorsForThisTrader = investors.stream()
-                    .filter(inv -> trader.getId().equals(inv.getSelectedAnswer()))
+            List<Player> myInvestors = investors.stream()
+                    .filter(inv -> traderId.equals(inv.getInvestTargetId()))
                     .collect(Collectors.toList());
 
-            if (investorsForThisTrader.isEmpty()) {
-                continue;
-            }
+            if (myInvestors.isEmpty()) continue;
 
-            switch (secretRole) {
-                case NORMAL -> handleNormalTrader(trader, investorsForThisTrader, traderCorrect, results);
-                case ORACLE -> handleOracleTrader(trader, investorsForThisTrader, traderCorrect, results);
-                case SCAMMER -> handleScammerTrader(trader, investorsForThisTrader, traderCorrect, results);
-            }
-        }
+            boolean isWinner = traderEligible.getOrDefault(traderId, false);
+            Player.SecretRole role = trader.getSecretRole();
 
-        // Tính cho các Investor không đặt vào ai hoặc đặt vào Trader không tồn tại
-        for (Player investor : investors) {
-            if (results.stream().noneMatch(r -> r.playerId.equals(investor.getId()))) {
+            log.info("💎 Processing {} investors for Trader {} (Winner: {}, Role: {})",
+                    myInvestors.size(), trader.getDisplayName(), isWinner, role);
+
+            // 🎭 SCAMMER who won (answered wrong) → STEALS all investor money
+            if (role == Player.SecretRole.SCAMMER && isWinner) {
+                double stolen = 0;
+                for (Player inv : myInvestors) {
+                    double amt = inv.getBlindBetAmount();
+                    double invCashBefore = inv.getCash();
+                    inv.setCash(Math.max(0, invCashBefore - amt));
+                    stolen += amt;
+
+                    results.add(new RoundResult(
+                            inv.getId(),
+                            inv.getDisplayName(),
+                            invCashBefore,
+                            inv.getCash(),
+                            -amt,
+                            "😈 Scammed by " + trader.getDisplayName()
+                    ));
+                }
+
+                double traderCashBefore = trader.getCash();
+                trader.setCash(traderCashBefore + stolen);
                 results.add(new RoundResult(
-                        investor.getId(),
-                        investor.getDisplayName(),
-                        investor.getCash(),
-                        investor.getCash(),
-                        "Không tham gia đầu tư"
+                        traderId,
+                        trader.getDisplayName(),
+                        traderCashBefore,
+                        trader.getCash(),
+                        stolen,
+                        "😈 Stole investor funds"
                 ));
             }
+            // ✅ NORMAL/ORACLE who won OR SCAMMER who lost → Investors win
+            else if (isWinner || (role == Player.SecretRole.SCAMMER && !isWinner)) {
+                double feeTotal = 0;
+
+                for (Player inv : myInvestors) {
+                    double amt = inv.getBlindBetAmount();
+                    double profit = amt;
+
+                    // NORMAL traders take 20% fee
+                    if (role == Player.SecretRole.NORMAL) {
+                        profit *= (1 - NORMAL_PROFIT_SHARE);
+                    }
+
+                    double invCashBefore = inv.getCash();
+                    inv.setCash(invCashBefore + profit);
+
+                    results.add(new RoundResult(
+                            inv.getId(),
+                            inv.getDisplayName(),
+                            invCashBefore,
+                            inv.getCash(),
+                            profit,
+                            "💎 Investment succeeded"
+                    ));
+
+                    if (role == Player.SecretRole.NORMAL) {
+                        feeTotal += (amt * NORMAL_PROFIT_SHARE);
+                    }
+                }
+
+                // NORMAL traders collect fee
+                if (role == Player.SecretRole.NORMAL && feeTotal > 0) {
+                    double traderCashBefore = trader.getCash();
+                    trader.setCash(traderCashBefore + feeTotal);
+                    results.add(new RoundResult(
+                            traderId,
+                            trader.getDisplayName(),
+                            traderCashBefore,
+                            trader.getCash(),
+                            feeTotal,
+                            "💼 Commission from investors"
+                    ));
+                }
+                // ORACLE gets robbed by investors
+                else if (role == Player.SecretRole.ORACLE && isWinner) {
+                    double penalty = trader.getBlindBetAmount() * ORACLE_PROFIT_SHARE;
+                    double traderCashBefore = trader.getCash();
+                    trader.setCash(Math.max(0, traderCashBefore - penalty));
+                    results.add(new RoundResult(
+                            traderId,
+                            trader.getDisplayName(),
+                            traderCashBefore,
+                            trader.getCash(),
+                            -penalty,
+                            "🔮 Oracle profits stolen by investors"
+                    ));
+                }
+            }
+            // ❌ Trader lost (and not Scammer with wrong answer) → Everyone loses
+            else {
+                for (Player inv : myInvestors) {
+                    double amt = inv.getBlindBetAmount();
+                    double invCashBefore = inv.getCash();
+                    inv.setCash(Math.max(0, invCashBefore - amt));
+
+                    results.add(new RoundResult(
+                            inv.getId(),
+                            inv.getDisplayName(),
+                            invCashBefore,
+                            inv.getCash(),
+                            -amt,
+                            "📉 Trader failed → Lost investment"
+                    ));
+                }
+            }
         }
 
+        log.info("✅ Round calculation complete. {} results generated.", results.size());
         return results;
-    }
-
-    // ============================================
-    // PRIVATE HELPER METHODS
-    // ============================================
-
-    /**
-     * Xử lý sập sàn: Trừ 10% tổng tài sản mọi người
-     */
-    private void applyMarketCrash(GameRoom room, List<RoundResult> results) {
-        for (Player player : room.getPlayers().values()) {
-            double cashBefore = player.getCash();
-            double penalty = cashBefore * MARKET_CRASH_PENALTY;
-            player.setCash(cashBefore - penalty);
-
-            results.add(new RoundResult(
-                    player.getId(),
-                    player.getDisplayName(),
-                    cashBefore,
-                    player.getCash(),
-                    "Sập sàn! (-10% tài sản)"
-            ));
-
-            log.info("Market crash penalty for {}: -{}", player.getDisplayName(), penalty);
-        }
-    }
-
-    /**
-     * Xử lý Trader NORMAL: Chia 20% lãi từ Investor
-     */
-    private void handleNormalTrader(Player trader, List<Player> investors,
-                                    boolean traderCorrect, List<RoundResult> results) {
-        if (!traderCorrect) {
-            // Trader sai thì Investor không mất gì thêm
-            for (Player investor : investors) {
-                results.add(new RoundResult(
-                        investor.getId(),
-                        investor.getDisplayName(),
-                        investor.getCash(),
-                        investor.getCash(),
-                        "Trader Normal sai - Giữ nguyên vốn"
-                ));
-            }
-            return;
-        }
-
-        // Trader đúng: Investor lãi, chia 20% cho Trader
-        double totalTraderBonus = 0;
-
-        for (Player investor : investors) {
-            double cashBefore = investor.getCash();
-            double investAmount = investor.getBlindBetAmount();
-            double investorProfit = investAmount; // Lãi 100% số cược
-
-            // Trích 20% lãi chia cho Trader
-            double shareToTrader = investorProfit * NORMAL_PROFIT_SHARE;
-            double investorNetProfit = investorProfit - shareToTrader;
-
-            investor.setCash(cashBefore + investorNetProfit);
-            totalTraderBonus += shareToTrader;
-
-            results.add(new RoundResult(
-                    investor.getId(),
-                    investor.getDisplayName(),
-                    cashBefore,
-                    investor.getCash(),
-                    String.format("Trader Normal đúng (+%.0f%%, chia 20%% cho Trader)",
-                            (investorNetProfit / investAmount) * 100)
-            ));
-
-            log.info("Investor {} profit from Normal Trader: +{} (shared {} to Trader)",
-                    investor.getDisplayName(), investorNetProfit, shareToTrader);
-        }
-
-        // Cộng bonus vào Trader
-        final double traderCashBefore = trader.getCash();
-        trader.setCash(trader.getCash() + totalTraderBonus);
-        final double traderCashAfter = trader.getCash();
-        final double bonusAmount = totalTraderBonus;
-
-        // Cập nhật result của Trader
-        results.stream()
-                .filter(r -> r.playerId.equals(trader.getId()))
-                .findFirst()
-                .ifPresent(r -> {
-                    r.cashAfter = traderCashAfter;
-                    r.profitLoss = traderCashAfter - traderCashBefore;
-                    r.reason += String.format(" + %.2f từ Investor", bonusAmount);
-                });
-
-        log.info("Trader Normal {} received bonus: +{}", trader.getDisplayName(), totalTraderBonus);
-    }
-
-    /**
-     * Xử lý Trader ORACLE: Chia 70% lãi Oracle cho Investor
-     */
-    private void handleOracleTrader(Player trader, List<Player> investors,
-                                    boolean traderCorrect, List<RoundResult> results) {
-        if (!traderCorrect) {
-            // Oracle không thể sai (theo lý thuyết), nhưng xử lý cho chắc
-            for (Player investor : investors) {
-                results.add(new RoundResult(
-                        investor.getId(),
-                        investor.getDisplayName(),
-                        investor.getCash(),
-                        investor.getCash(),
-                        "Oracle sai (bất thường) - Giữ nguyên vốn"
-                ));
-            }
-            return;
-        }
-
-        // Oracle đúng: Lấy 70% lãi Oracle chia đều cho Investor
-        double oracleProfit = trader.getBlindBetAmount(); // Lãi của Oracle
-        double sharePool = oracleProfit * ORACLE_PROFIT_SHARE;
-        double sharePerInvestor = investors.isEmpty() ? 0 : sharePool / investors.size();
-
-        // Trừ tiền từ Oracle
-        final double traderCashBefore = trader.getCash();
-        trader.setCash(trader.getCash() - sharePool);
-        final double traderCashAfter = trader.getCash();
-        final double sharedAmount = sharePool;
-
-        // Cập nhật result của Oracle
-        results.stream()
-                .filter(r -> r.playerId.equals(trader.getId()))
-                .findFirst()
-                .ifPresent(r -> {
-                    r.cashAfter = traderCashAfter;
-                    r.profitLoss = traderCashAfter - traderCashBefore;
-                    r.reason += String.format(" - %.2f chia cho Investor", sharedAmount);
-                });
-
-        // Chia cho Investor
-        for (Player investor : investors) {
-            double cashBefore = investor.getCash();
-            double investorProfit = investor.getBlindBetAmount() + sharePerInvestor;
-
-            investor.setCash(cashBefore + investorProfit);
-
-            results.add(new RoundResult(
-                    investor.getId(),
-                    investor.getDisplayName(),
-                    cashBefore,
-                    investor.getCash(),
-                    String.format("Oracle đúng (+100%% + %.2f từ Oracle)", sharePerInvestor)
-            ));
-
-            log.info("Investor {} profit from Oracle: +{} (includes {} Oracle share)",
-                    investor.getDisplayName(), investorProfit, sharePerInvestor);
-        }
-
-        log.info("Oracle {} shared profit: -{}", trader.getDisplayName(), sharePool);
-    }
-
-    /**
-     * Xử lý Trader SCAMMER: Nếu lừa thành công, ăn trọn 100% tiền Investor
-     */
-    private void handleScammerTrader(Player trader, List<Player> investors,
-                                     boolean traderCorrect, List<RoundResult> results) {
-        if (traderCorrect) {
-            // Scammer đúng thì Investor lãi bình thường
-            for (Player investor : investors) {
-                double cashBefore = investor.getCash();
-                double profit = investor.getBlindBetAmount();
-                investor.setCash(cashBefore + profit);
-
-                results.add(new RoundResult(
-                        investor.getId(),
-                        investor.getDisplayName(),
-                        cashBefore,
-                        investor.getCash(),
-                        "Scammer đúng (may mắn) - Lãi 100%"
-                ));
-
-                log.info("Investor {} lucky profit from Scammer: +{}",
-                        investor.getDisplayName(), profit);
-            }
-            return;
-        }
-
-        // Scammer lừa thành công: Ăn trọn 100% tiền cược của Investor
-        double totalStolen = 0;
-
-        for (Player investor : investors) {
-            double cashBefore = investor.getCash();
-            double investAmount = investor.getBlindBetAmount();
-
-            // Investor mất toàn bộ số tiền cược
-            investor.setCash(cashBefore - investAmount);
-            totalStolen += investAmount;
-
-            results.add(new RoundResult(
-                    investor.getId(),
-                    investor.getDisplayName(),
-                    cashBefore,
-                    investor.getCash(),
-                    "Bị Scammer lừa (-100% cược)"
-            ));
-
-            log.info("Investor {} scammed: -{}", investor.getDisplayName(), investAmount);
-        }
-
-        // Cộng tiền vào Scammer
-        final double traderCashBefore = trader.getCash();
-        trader.setCash(trader.getCash() + totalStolen);
-        final double traderCashAfter = trader.getCash();
-        final double stolenAmount = totalStolen;
-
-        // Cập nhật result của Scammer
-        results.stream()
-                .filter(r -> r.playerId.equals(trader.getId()))
-                .findFirst()
-                .ifPresent(r -> {
-                    r.cashAfter = traderCashAfter;
-                    r.profitLoss = traderCashAfter - traderCashBefore;
-                    r.reason += String.format(" + %.2f từ lừa đảo", stolenAmount);
-                });
-
-        log.info("Scammer {} stole: +{}", trader.getDisplayName(), totalStolen);
     }
 }

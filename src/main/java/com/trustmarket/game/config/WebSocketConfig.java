@@ -20,9 +20,9 @@ public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
 
     @Override
     public void registerStompEndpoints(StompEndpointRegistry registry) {
-        // Đường dẫn để Frontend kết nối vào: ws://localhost:8080/ws
+        // Thêm .setAllowedOriginPatterns("*") vào giữa
         registry.addEndpoint("/ws")
-                .setAllowedOriginPatterns("*") // Cho phép mọi nguồn kết nối (Dev mode)
-                .withSockJS(); // Fallback nếu trình duyệt không hỗ trợ WebSocket
+                .setAllowedOriginPatterns("*") // <--- DÒNG QUAN TRỌNG NHẤT
+                .withSockJS();
     }
 }
